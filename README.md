@@ -1,4 +1,4 @@
-99.9% Vibe Coded AMD Hypervisor trying out Opus 4.6.
+99.9% Vibe Coded AMD Hypervisor trying out Opus 4.6. (Used SimpleSvm as the fork)
 
 Tested with basic imgui internal menu for Apex Legends and worked while EAC was active. Don't plan on using this at all so no idea about EAC detecting this.
 
