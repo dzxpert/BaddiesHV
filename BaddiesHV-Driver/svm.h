@@ -603,6 +603,7 @@ typedef struct _VCPU_DATA {
   /* === Per-CPU anti-detection state === */
   UINT64 VirtualEfer; /* Shadow EFER value returned to guest
                        * (SVME bit cleared for stealth)       */
+  UINT64 TscOnVmexit; /* TSC at VMEXIT entry — used to measure handler time */
 
   /* === CR3 cache — avoids calling PsLookupProcessByProcessId from host === */
   CR3_CACHE_ENTRY Cr3Cache[CR3_CACHE_MAX_ENTRIES];

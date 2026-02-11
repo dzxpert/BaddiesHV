@@ -830,6 +830,9 @@ BOOLEAN SvmVmexitHandler(_Inout_ PVCPU_DATA Vcpu,
    * no InterlockedCompareExchange, no spinlocks.
    */
 
+  /* Capture TSC at VMEXIT entry for timing compensation */
+  UINT64 tscEntry = __rdtsc();
+
   /* Check devirtualize flag (volatile read, no Interlocked needed) */
   if (g_HvData.DevirtualizeFlag) {
     /*
@@ -1084,24 +1087,37 @@ BOOLEAN SvmVmexitHandler(_Inout_ PVCPU_DATA Vcpu,
     UINT32 msrNum = (UINT32)GuestCtx->Rcx;
     BOOLEAN isWrite = (BOOLEAN)(Vcpu->GuestVmcb->Control.ExitInfo1 & 1);
 
-    if (msrNum == MSR_EFER && isWrite) {
-      /* Filter EFER write: keep SVME set, store clean value for guest */
-      UINT64 newVal =
-          ((UINT64)(UINT32)GuestCtx->Rdx << 32) | (UINT64)(UINT32)GuestCtx->Rax;
-      Vcpu->VirtualEfer = newVal & ~EFER_SVME;
-      Vcpu->GuestVmcb->StateSave.Efer = newVal | EFER_SVME;
-    } else if (msrNum == MSR_EFER && !isWrite) {
-      /* Return shadow EFER (SVME cleared for stealth) */
-      GuestCtx->Rax = (UINT32)(Vcpu->VirtualEfer);
-      GuestCtx->Rdx = (UINT32)(Vcpu->VirtualEfer >> 32);
-    } else if (isWrite) {
+    if (!isWrite) {
+      /* ===== RDMSR ===== */
+      UINT64 val;
+      switch (msrNum) {
+      case MSR_EFER:
+        val = Vcpu->VirtualEfer; /* Shadow: SVME bit cleared */
+        break;
+      case MSR_VM_CR:
+      case MSR_VM_HSAVE_PA:
+      case MSR_SVM_KEY:
+        val = 0; /* Hide all SVM state from guest/EAC */
+        break;
+      default:
+        val = __readmsr(msrNum); /* Passthrough */
+        break;
+      }
+      GuestCtx->Rax = (UINT64)(UINT32)(val & 0xFFFFFFFF);
+      GuestCtx->Rdx = (UINT64)(UINT32)(val >> 32);
+    } else {
+      /* ===== WRMSR ===== */
       UINT64 val =
           ((UINT64)(UINT32)GuestCtx->Rdx << 32) | (UINT64)(UINT32)GuestCtx->Rax;
-      __writemsr(msrNum, val);
-    } else {
-      UINT64 val = __readmsr(msrNum);
-      GuestCtx->Rax = (UINT32)val;
-      GuestCtx->Rdx = (UINT32)(val >> 32);
+      switch (msrNum) {
+      case MSR_EFER:
+        Vcpu->VirtualEfer = val & ~EFER_SVME;
+        Vcpu->GuestVmcb->StateSave.Efer = val | EFER_SVME;
+        break;
+      default:
+        __writemsr(msrNum, val);
+        break;
+      }
     }
 
     /* Advance RIP */
@@ -1147,6 +1163,14 @@ BOOLEAN SvmVmexitHandler(_Inout_ PVCPU_DATA Vcpu,
       Vcpu->GuestVmcb->StateSave.Rip += 3;
     break;
   }
+
+  /*
+   * Anti-detection: subtract VMEXIT handler time from guest-visible TSC.
+   * Hardware TscOffset is applied automatically on every guest RDTSC/RDTSCP.
+   * This accumulates across VMEXITs, keeping the guest's view of time clean.
+   */
+  UINT64 tscExit = __rdtsc();
+  Vcpu->GuestVmcb->Control.TscOffset -= (INT64)(tscExit - tscEntry);
 
   return FALSE; /* Continue running the guest */
 }
