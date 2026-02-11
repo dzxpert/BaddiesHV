@@ -81,9 +81,12 @@
   <ItemGroup>
     <ClCompile Include="entry.c" />
     <ClCompile Include="svm.c" />
+    <ClCompile Include="npt.c" />
+    <ClCompile Include="mem_ops.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="svm.h" />
+    <ClInclude Include="npt.h" />
     <ClInclude Include="..\shared\hvcomm.h" />
   </ItemGroup>
   <ItemGroup>

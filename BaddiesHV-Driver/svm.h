@@ -18,6 +18,8 @@
 #ifndef SVM_H
 #define SVM_H
 
+#include "../shared/hvcomm.h"
+#include "npt.h"
 #include <intrin.h>
 #include <ntddk.h>
 
@@ -608,6 +610,8 @@ typedef struct _VCPU_DATA {
 
   /* === Shared page registration (set during HV_CMD_REGISTER) === */
   UINT64 SharedPageGpa; /* GPA of the loader's HV_SHARED_PAGE   */
+  UINT64 SharedPageVa;  /* Original user VA (valid under guest CR3) */
+  UINT64 SharedPageCr3; /* Guest CR3 at registration time */
   BOOLEAN SharedPageRegistered;
 
   /* === Processor identification === */
@@ -642,6 +646,9 @@ typedef struct _HV_GLOBAL_DATA {
   volatile LONG TlbFlushPending;
   volatile UINT64 TlbFlushGpa;
   volatile UINT32 TlbFlushAsid;
+
+  /* NPT (Nested Page Tables) — Phase 2 */
+  NPT_CONTEXT NptContext; /* Identity map of physical memory */
 
   /* Feature support flags from CPUID check */
   BOOLEAN NptSupported;
@@ -686,6 +693,22 @@ VOID SvmDevirtualizeAllProcessors(VOID);
 BOOLEAN SvmVmexitHandler(_Inout_ PVCPU_DATA Vcpu,
                          _Inout_ PGUEST_CONTEXT GuestCtx);
 NTSTATUS SvmAllocateMsrpm(VOID);
+
+/* ============================================================================
+ *  Function Declarations — mem_ops.c
+ * ============================================================================
+ */
+
+NTSTATUS HvCacheCr3(_In_ PVCPU_DATA Vcpu, _In_ UINT32 Pid,
+                    _Out_ PUINT64 Cr3Out);
+NTSTATUS
+HvReadProcessMemory(_In_ PVCPU_DATA Vcpu, _In_ UINT32 Pid, _In_ UINT64 GuestVa,
+                    _Out_writes_bytes_(Size) volatile UINT8 *DataBuffer,
+                    _In_ UINT64 Size);
+NTSTATUS HvWriteProcessMemory(_In_ PVCPU_DATA Vcpu, _In_ UINT32 Pid,
+                              _In_ UINT64 GuestVa,
+                              _In_reads_bytes_(Size) volatile UINT8 *DataBuffer,
+                              _In_ UINT64 Size);
 
 /* ============================================================================
  *  Function Declarations — svm_asm.asm

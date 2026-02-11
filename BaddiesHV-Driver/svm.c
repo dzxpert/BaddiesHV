@@ -17,7 +17,6 @@
  */
 
 #include "svm.h"
-#include "../shared/hvcomm.h"
 
 /* Logging tag for DbgPrintEx */
 #define HV_LOG(fmt, ...)                                                       \
@@ -348,8 +347,13 @@ NTSTATUS SvmInitializeVcpu(_In_ ULONG ProcessorIndex,
    * Correctness first; optimize in Phase 3. */
   ctrl->CleanBits = 0;
 
-  /* NP_ENABLE = 0 for Phase 1 (no NPT yet — that's Phase 2) */
-  ctrl->NestedControl = 0;
+  /* NPT (Nested Paging) — Phase 2: enable and point to identity map */
+  if (g_HvData.NptSupported && g_HvData.NptContext.Pml4Pa != 0) {
+    ctrl->NestedControl = 1; /* NP_ENABLE bit 0 */
+    ctrl->NestedCr3 = g_HvData.NptContext.Pml4Pa;
+  } else {
+    ctrl->NestedControl = 0;
+  }
 
   /* ------------------------------------------------------------------
    * Populate VMCB State Save Area with current processor state.
@@ -843,12 +847,192 @@ BOOLEAN SvmVmexitHandler(_Inout_ PVCPU_DATA Vcpu,
     UINT32 leaf = (UINT32)GuestCtx->Rax;
     UINT32 subleaf = (UINT32)GuestCtx->Rcx;
 
-    // Check magic hypercall leaf for instructions
+    /* Check magic hypercall leaf */
     if (leaf == HV_CPUID_LEAF) {
-      GuestCtx->Rax = HV_CPUID_LEAF;
-      GuestCtx->Rbx = 1;
-      GuestCtx->Rcx = Vcpu->ProcessorIndex;
-      GuestCtx->Rdx = 0;
+      /* Command byte is in ECX[7:0]. For REGISTER_LO/HI, ECX[31:8]
+       * carries VA data, so we must mask to get the command. */
+      UINT32 cmd = subleaf & 0xFF;
+      switch (cmd) {
+
+      case HV_CMD_PING:
+        GuestCtx->Rax = HV_CPUID_LEAF;
+        GuestCtx->Rbx = 1;
+        GuestCtx->Rcx = Vcpu->ProcessorIndex;
+        GuestCtx->Rdx = 0;
+        break;
+
+      case HV_CMD_REGISTER_LO: {
+        /* Two-step registration: Step 1 — cache low 24 bits of VA.
+         * ECX[31:8] = VA[23:0]. Store in VMCB SoftwareReserved. */
+        UINT32 vaLo24 = subleaf >> 8;
+        *(UINT32 *)&Vcpu->GuestVmcb->Control.SoftwareReserved[0] = vaLo24;
+        GuestCtx->Rax = HV_STATUS_SUCCESS;
+        break;
+      }
+
+      case HV_CMD_REGISTER_HI: {
+        /* Two-step registration: Step 2 — combine and translate.
+         * ECX[31:8] = VA[47:24]. Combine with cached low 24 bits. */
+        UINT32 vaHi24 = subleaf >> 8;
+        UINT32 vaLo24 =
+            *(UINT32 *)&Vcpu->GuestVmcb->Control.SoftwareReserved[0];
+        UINT64 sharedPageVa = ((UINT64)vaHi24 << 24) | (UINT64)vaLo24;
+
+        /* Sign-extend if bit 47 is set (kernel VA) */
+        if (sharedPageVa & (1ULL << 47))
+          sharedPageVa |= 0xFFFF000000000000ULL;
+
+        /* Translate VA → PA.
+         *
+         * During VMEXIT the host CR3 is active (from VMRUN time, typically
+         * SYSTEM context). The loader's user-mode VA isn't mapped there.
+         * We temporarily swap to the guest CR3 (= loader's process CR3,
+         * saved in VMCB) so MmGetPhysicalAddress can resolve it.
+         *
+         * Safe because:
+         *   - GIF=0: no interrupts, no preemption
+         *   - Kernel code + stack are mapped identically in all processes
+         *   - We restore host CR3 immediately after
+         */
+        UINT64 guestCr3 = Vcpu->GuestVmcb->StateSave.Cr3;
+        UINT64 hostCr3 = __readcr3();
+        __writecr3(guestCr3);
+
+        PHYSICAL_ADDRESS pa = MmGetPhysicalAddress((PVOID)sharedPageVa);
+
+        __writecr3(hostCr3);
+
+        if (pa.QuadPart == 0) {
+          GuestCtx->Rax = HV_STATUS_TRANSLATION_FAIL;
+          GuestCtx->Rbx = sharedPageVa; /* diagnostic */
+          break;
+        }
+
+        Vcpu->SharedPageGpa = (UINT64)pa.QuadPart;
+        Vcpu->SharedPageVa = sharedPageVa;
+        Vcpu->SharedPageCr3 = guestCr3;
+        Vcpu->SharedPageRegistered = TRUE;
+        GuestCtx->Rax = HV_STATUS_SUCCESS;
+        /* Return reconstructed VA for loader verification */
+        GuestCtx->Rbx = (UINT64)(UINT32)(sharedPageVa & 0xFFFFFFFF);
+        GuestCtx->Rcx = (UINT64)(UINT32)(sharedPageVa >> 32);
+        break;
+      }
+
+      case HV_CMD_GET_CR3: {
+        if (!Vcpu->SharedPageRegistered) {
+          GuestCtx->Rax = HV_STATUS_NOT_REGISTERED;
+          break;
+        }
+
+        /* Test: read shared page via CR3 swap, return guest CR3 as dummy */
+        UINT64 hostCr3 = __readcr3();
+        volatile HV_SHARED_PAGE *sp =
+            (volatile HV_SHARED_PAGE *)Vcpu->SharedPageVa;
+
+        __writecr3(Vcpu->SharedPageCr3);
+        UINT64 magic = sp->request.magic;
+        UINT32 reqPid = sp->request.pid;
+        __writecr3(hostCr3);
+
+        if (magic != HV_MAGIC) {
+          GuestCtx->Rax = HV_STATUS_INVALID_MAGIC;
+          break;
+        }
+
+        /* Walk EPROCESS list to find target CR3 */
+        UINT64 cr3;
+        NTSTATUS cmdStatus = HvCacheCr3(Vcpu, reqPid, &cr3);
+        if (NT_SUCCESS(cmdStatus)) {
+          __writecr3(Vcpu->SharedPageCr3);
+          sp->request.result = cr3;
+          __writecr3(hostCr3);
+          GuestCtx->Rax = HV_STATUS_SUCCESS;
+        } else {
+          GuestCtx->Rax = HV_STATUS_INVALID_PID;
+        }
+        break;
+      }
+
+      case HV_CMD_READ:
+      case HV_CMD_WRITE: {
+        /* Read command from registered shared page */
+        if (!Vcpu->SharedPageRegistered) {
+          GuestCtx->Rax = HV_STATUS_NOT_REGISTERED;
+          break;
+        }
+
+        UINT64 hostCr3 = __readcr3();
+        UINT64 spVa = Vcpu->SharedPageVa;
+        volatile HV_SHARED_PAGE *sp = (volatile HV_SHARED_PAGE *)spVa;
+
+        /* --- Phase 1: Read request fields under guest CR3 --- */
+        __writecr3(Vcpu->SharedPageCr3);
+
+        UINT64 magic = sp->request.magic;
+        UINT32 reqCmd = sp->request.command;
+        UINT32 reqPid = sp->request.pid;
+        UINT64 reqAddr = sp->request.address;
+        UINT64 reqSize = sp->request.size;
+
+        __writecr3(hostCr3);
+
+        /* Validate magic */
+        if (magic != HV_MAGIC) {
+          GuestCtx->Rax = HV_STATUS_INVALID_MAGIC;
+          break;
+        }
+
+        /* Clamp size to inline data buffer */
+        if (reqSize > HV_DATA_SIZE)
+          reqSize = HV_DATA_SIZE;
+
+        NTSTATUS cmdStatus;
+        if (cmd == HV_CMD_READ) {
+          UINT8 localBuf[256];
+          UINT64 readSize = reqSize;
+          if (readSize > sizeof(localBuf))
+            readSize = sizeof(localBuf);
+
+          cmdStatus = HvReadProcessMemory(Vcpu, reqPid, reqAddr,
+                                          (volatile UINT8 *)localBuf, readSize);
+          if (NT_SUCCESS(cmdStatus)) {
+            __writecr3(Vcpu->SharedPageCr3);
+            for (UINT64 i = 0; i < readSize; i++)
+              sp->data[i] = localBuf[i];
+            __writecr3(hostCr3);
+          }
+          GuestCtx->Rax = NT_SUCCESS(cmdStatus) ? HV_STATUS_SUCCESS
+                                                : HV_STATUS_TRANSLATION_FAIL;
+        } else { /* HV_CMD_WRITE */
+          UINT8 localBuf[256];
+          UINT64 writeSize = reqSize;
+          if (writeSize > sizeof(localBuf))
+            writeSize = sizeof(localBuf);
+
+          __writecr3(Vcpu->SharedPageCr3);
+          for (UINT64 i = 0; i < writeSize; i++)
+            localBuf[i] = sp->data[i];
+          __writecr3(hostCr3);
+
+          cmdStatus = HvWriteProcessMemory(
+              Vcpu, reqPid, reqAddr, (volatile UINT8 *)localBuf, writeSize);
+          GuestCtx->Rax = NT_SUCCESS(cmdStatus) ? HV_STATUS_SUCCESS
+                                                : HV_STATUS_TRANSLATION_FAIL;
+        }
+        break;
+      }
+
+      case HV_CMD_DEVIRT:
+        g_HvData.DevirtualizeFlag = TRUE;
+        GuestCtx->Rax = HV_STATUS_SUCCESS;
+        /* Don't return TRUE here — let the next VMEXIT check handle it */
+        break;
+
+      default:
+        GuestCtx->Rax = HV_STATUS_INVALID_COMMAND;
+        break;
+      }
     } else {
       __cpuidex(cpuInfo, (int)leaf, (int)subleaf);
       GuestCtx->Rax = (UINT64)(UINT32)cpuInfo[0];
@@ -867,7 +1051,7 @@ BOOLEAN SvmVmexitHandler(_Inout_ PVCPU_DATA Vcpu,
       }
     }
 
-	// advance ripping otherwise we get stuck in a CPUID loop
+    // advance ripping otherwise we get stuck in a CPUID loop
     if (Vcpu->GuestVmcb->Control.NextRip != 0)
       Vcpu->GuestVmcb->StateSave.Rip = Vcpu->GuestVmcb->Control.NextRip;
     else
@@ -1123,6 +1307,19 @@ NTSTATUS SvmSubvertAllProcessors(VOID) {
   InterlockedExchange(&g_HvData.DevirtualizeFlag, FALSE);
   InterlockedExchange(&g_HvData.DevirtualizedCount, 0);
 
+  /* Build NPT identity map (Phase 2) */
+  if (g_HvData.NptSupported) {
+    status = NptBuildIdentityMap(&g_HvData.NptContext);
+    if (!NT_SUCCESS(status)) {
+      HV_LOG_ERROR("Failed to build NPT identity map: 0x%08X", status);
+      ExFreePoolWithTag(g_HvData.VcpuArray, 'ARVC');
+      g_HvData.VcpuArray = NULL;
+      return status;
+    }
+    HV_LOG("NPT identity map built.  PML4 PA = 0x%llX",
+           g_HvData.NptContext.Pml4Pa);
+  }
+
   /* Launch DPC on all processors */
   KeGenericCallDpc(SvmSubvertProcessorDpc, NULL);
 
@@ -1226,6 +1423,9 @@ VOID SvmDevirtualizeAllProcessors(VOID) {
     MmFreeContiguousMemory(g_HvData.MsrPermissionMap);
     g_HvData.MsrPermissionMap = NULL;
   }
+
+  /* Free NPT page tables */
+  NptDestroyIdentityMap(&g_HvData.NptContext);
 
   HV_LOG("All resources freed — devirtualize complete");
 }
