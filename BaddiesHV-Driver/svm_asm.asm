@@ -250,24 +250,82 @@ ALIGN 16
     ret
 
     ; =================================================================
-    ;  Devirtualize — must STGI before returning (GIF=0 during handler)
+    ;  Devirtualize — properly restore guest state and IRETQ
+    ;
+    ;  The C handler has:
+    ;    - Advanced guest RIP past the triggering instruction
+    ;    - Marked VCPU as devirtualized
+    ;    - NOT disabled SVME (we need VMLOAD first)
+    ;
+    ;  We must:
+    ;    1. STGI (re-enable interrupts)
+    ;    2. VMLOAD guest segment hidden state (needs SVME=1)
+    ;    3. Disable SVME via EFER MSR
+    ;    4. Restore guest CR3
+    ;    5. Build IRETQ frame from VMCB (handles ring transitions)
+    ;    6. Restore all guest GPRs
+    ;    7. IRETQ → seamless native continuation
     ; =================================================================
 @@Devirtualize:
-    ; Re-enable interrupts before returning to OS
     stgi
-    ; Restore caller's original RSP (with callee-saved regs pushed)
-    mov     rsp, [rsp + FRAME_BELOW + HSL_ORIG_RSP]
 
-    ; Pop callee-saved registers and return
-    pop     r15
-    pop     r14
-    pop     r13
-    pop     r12
-    pop     rdi
-    pop     rsi
-    pop     rbx
-    pop     rbp
-    ret
+    ; Step 2: VMLOAD guest FS/GS/TR/LDTR hidden state (requires SVME=1)
+    mov     rax, [rsp + FRAME_BELOW + HSL_VMCB_PA]
+    vmload  rax
+
+    ; Step 3: Disable SVME via EFER MSR (0xC0000080)
+    mov     ecx, 0C0000080h
+    rdmsr
+    and     eax, NOT 1000h          ; clear bit 12 (SVME)
+    wrmsr
+
+    ; Step 4: Get VMCB VA and restore guest CR3
+    mov     r13, [rsp + FRAME_BELOW + HSL_VCPU]
+    mov     rax, [r13 + VCPU_VMCB_VA]
+    mov     rcx, [rax + 550h]              ; VMCB.StateSave.CR3
+    mov     cr3, rcx
+
+    ; Step 5: Read IRET frame values from VMCB into scratch registers
+    movzx   r8,  word ptr [rax + 420h]     ; SS selector
+    mov     r9,  [rax + 5D8h]              ; RSP
+    mov     r10, [rax + 570h]              ; RFLAGS
+    movzx   r11, word ptr [rax + 410h]     ; CS selector
+    mov     rcx, [rax + 578h]              ; RIP (advanced by C handler)
+
+    ; Get guest RAX from VMCB (stash in rdx temporarily)
+    mov     rdx, [rax + 5F8h]              ; VMCB.StateSave.RAX
+
+    ; Step 6a: Restore non-scratch GPRs from GUEST_CONTEXT
+    lea     r14, [rsp + GUEST_CTX]
+    mov     rbx, [r14 + 18h]
+    mov     rbp, [r14 + 20h]
+    mov     rsi, [r14 + 28h]
+    mov     rdi, [r14 + 30h]
+    mov     r12, [r14 + 58h]
+    mov     r15, [r14 + 70h]
+
+    ; Build IRET frame on host stack (push order: SS, RSP, RFLAGS, CS, RIP)
+    push    r8                              ; SS
+    push    r9                              ; RSP
+    push    r10                             ; RFLAGS
+    push    r11                             ; CS
+    push    rcx                             ; RIP
+
+    ; Step 6b: Restore remaining GPRs from GUEST_CONTEXT
+    ; (r14 still valid — points to host stack which is still accessible)
+    mov     r8,  [r14 + 38h]
+    mov     r9,  [r14 + 40h]
+    mov     r10, [r14 + 48h]
+    mov     r11, [r14 + 50h]
+    mov     r13, [r14 + 60h]
+    mov     rcx, [r14 + 08h]               ; guest RCX
+    mov     rax, rdx                        ; guest RAX (was stashed in rdx)
+    mov     rdx, [r14 + 10h]               ; guest RDX
+    mov     r14, [r14 + 68h]               ; guest R14 (LAST — destroys ptr)
+
+    ; Step 7: IRETQ → pops RIP, CS, RFLAGS, RSP, SS
+    ; Handles ring 0→0 and ring 0→3 transitions correctly
+    iretq
 
 SvmLaunchVm ENDP
 

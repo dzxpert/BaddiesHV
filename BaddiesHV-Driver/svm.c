@@ -832,6 +832,27 @@ BOOLEAN SvmVmexitHandler(_Inout_ PVCPU_DATA Vcpu,
 
   /* Check devirtualize flag (volatile read, no Interlocked needed) */
   if (g_HvData.DevirtualizeFlag) {
+    /*
+     * Advance guest RIP past the current instruction so the guest
+     * doesn't re-execute it after devirtualization.
+     */
+    UINT64 exitCode = Vcpu->GuestVmcb->Control.ExitCode;
+    if (exitCode == VMEXIT_CPUID) {
+      if (Vcpu->GuestVmcb->Control.NextRip != 0)
+        Vcpu->GuestVmcb->StateSave.Rip = Vcpu->GuestVmcb->Control.NextRip;
+      else
+        Vcpu->GuestVmcb->StateSave.Rip += 2; /* CPUID = 2 bytes */
+    }
+
+    /* Mark this VCPU as devirtualized */
+    Vcpu->Subverted = FALSE;
+    InterlockedIncrement(&g_HvData.DevirtualizedCount);
+
+    /*
+     * Assembly will: STGI, VMLOAD (needs SVME=1), disable SVME,
+     * restore guest CR3, build IRETQ frame, restore GPRs, IRETQ.
+     * DO NOT disable SVME here — VMLOAD needs it.
+     */
     return TRUE;
   }
 
