@@ -26,15 +26,11 @@ typedef struct _VCPU_DATA VCPU_DATA, *PVCPU_DATA;
  * ============================================================================
  */
 
-#define MAX_PROTECTED_RANGES 64
+#define MAX_PROTECTED_RANGES 256
 
 typedef struct _PROTECTED_RANGE {
-  UINT64 Gpa;           /* Start GPA of protected range */
-  UINT64 Size;          /* Size in bytes */
-  UINT64 OriginalPde;   /* Backup of original PDE for unprotect */
-  UINT32 PdIndex;       /* PD index for quick lookup */
-  UINT32 PdptIndex;     /* PDPT index */
-  UINT32 Pml4Index;     /* PML4 index */
+  UINT64 Gpa;  /* Start GPA of protected range */
+  UINT64 Size; /* Size in bytes */
 } PROTECTED_RANGE, *PPROTECTED_RANGE;
 
 typedef struct _NPT_PROTECTION_CONTEXT {

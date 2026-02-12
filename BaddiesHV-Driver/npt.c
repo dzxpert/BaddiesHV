@@ -195,6 +195,48 @@ NTSTATUS NptBuildIdentityMap(_Out_ PNPT_CONTEXT NptCtx) {
   return STATUS_SUCCESS;
 }
 
+/*
+ * NptSplitLargePage — Split a 2MB large page into 512 4KB pages.
+ */
+NTSTATUS NptSplitLargePage(_In_ PNPT_CONTEXT NptCtx, _In_ PNPT_ENTRY Pde,
+                           _In_ UINT64 GpaBase) {
+  UINT64 oldPde = *Pde;
+
+  /* If already split (not large page), we are good */
+  if (!(oldPde & NPT_LARGE_PAGE)) {
+    return STATUS_SUCCESS;
+  }
+
+  /* Allocate new Page Table (PT) */
+  PNPT_ENTRY pt = NptAllocatePage(NptCtx);
+  if (!pt) {
+    return STATUS_INSUFFICIENT_RESOURCES;
+  }
+
+  /* Extract memory type attributes (PWT, PCD) from old PDE.
+   * In our simple map, we only use PWT|PCD for UC, or 0 for WB.
+   * We copy these bits to the new PTEs.
+   * Note: PAT bit position differs (bit 12 vs 7), but we don't use PAT. */
+  UINT64 memTypeBits = oldPde & (NPT_PWT | NPT_PCD);
+
+  /* Fill PT with 512 4KB entries */
+  for (UINT32 i = 0; i < 512; i++) {
+    UINT64 pteGpa = GpaBase + (i * NPT_PAGE_SIZE_4KB);
+
+    /* Construct PTE: GPA | Present | Write | User | MemType */
+    UINT64 pte = pteGpa | NPT_PRESENT | NPT_WRITE | NPT_USER | memTypeBits;
+    pt[i] = pte;
+  }
+
+  /* Update PDE to point to new PT
+   * NPT_MAKE_TABLE_ENTRY handles PRESENT|WRITE|USER.
+   * Clear LARGE_PAGE bit implicitly by using table entry format. */
+  UINT64 newPde = NPT_MAKE_TABLE_ENTRY(NptVaToPa(pt));
+  *Pde = newPde;
+
+  return STATUS_SUCCESS;
+}
+
 /* ============================================================================
  * NptDestroyIdentityMap — Free all NPT page tables.
  * ============================================================================

@@ -25,32 +25,36 @@ NTSTATUS NptProtectRange(_In_ PNPT_CONTEXT NptCtx,
     return STATUS_INVALID_PARAMETER;
   }
 
-  /* Align GPA down to 2MB boundary, size up to 2MB multiple */
-  UINT64 gpaAligned = Gpa & ~(NPT_PAGE_SIZE_2MB - 1);
-  UINT64 endGpa = (Gpa + Size + NPT_PAGE_SIZE_2MB - 1) & ~(NPT_PAGE_SIZE_2MB - 1);
+  /* Align range to 4KB boundary */
+  UINT64 gpaAligned = Gpa & ~(NPT_PAGE_SIZE_4KB - 1);
+  UINT64 endGpa =
+      (Gpa + Size + NPT_PAGE_SIZE_4KB - 1) & ~(NPT_PAGE_SIZE_4KB - 1);
   UINT64 sizeAligned = endGpa - gpaAligned;
 
   HV_LOG("NptProtectRange: GPA 0x%llX size 0x%llX (aligned: 0x%llX - 0x%llX)",
          Gpa, Size, gpaAligned, endGpa);
 
-  /* Walk NPT and protect each 2MB page */
-  for (UINT64 gpa = gpaAligned; gpa < endGpa; gpa += NPT_PAGE_SIZE_2MB) {
+  /* Track the range */
+  if (ProtCtx->RangeCount >= MAX_PROTECTED_RANGES) {
+    HV_LOG_ERROR("NptProtectRange: Too many protected ranges (max %u)",
+                 MAX_PROTECTED_RANGES);
+    return STATUS_INSUFFICIENT_RESOURCES;
+  }
 
-    if (ProtCtx->RangeCount >= MAX_PROTECTED_RANGES) {
-      HV_LOG_ERROR("NptProtectRange: Too many protected ranges (max %u)",
-                   MAX_PROTECTED_RANGES);
-      return STATUS_INSUFFICIENT_RESOURCES;
-    }
+  /* Walk NPT and protect each 4KB page */
+  for (UINT64 curGpa = gpaAligned; curGpa < endGpa;
+       curGpa += NPT_PAGE_SIZE_4KB) {
 
-    UINT32 pml4Idx = (UINT32)NPT_PML4_INDEX(gpa);
-    UINT32 pdptIdx = (UINT32)NPT_PDPT_INDEX(gpa);
-    UINT32 pdIdx = (UINT32)NPT_PD_INDEX(gpa);
+    UINT32 pml4Idx = (UINT32)NPT_PML4_INDEX(curGpa);
+    UINT32 pdptIdx = (UINT32)NPT_PDPT_INDEX(curGpa);
+    UINT32 pdIdx = (UINT32)NPT_PD_INDEX(curGpa);
+    UINT32 ptIdx = (UINT32)NPT_PT_INDEX(curGpa);
 
     /* --- Walk to PD level --- */
     PNPT_ENTRY pml4 = NptCtx->Pml4;
     if (!(pml4[pml4Idx] & NPT_PRESENT)) {
       HV_LOG_ERROR("NptProtectRange: PML4[%u] not present for GPA 0x%llX",
-                   pml4Idx, gpa);
+                   pml4Idx, curGpa);
       return STATUS_UNSUCCESSFUL;
     }
 
@@ -58,14 +62,9 @@ NTSTATUS NptProtectRange(_In_ PNPT_CONTEXT NptCtx,
     PHYSICAL_ADDRESS pa;
     pa.QuadPart = (LONGLONG)pdptPa;
     PNPT_ENTRY pdpt = (PNPT_ENTRY)MmGetVirtualForPhysical(pa);
-    if (!pdpt) {
-      HV_LOG_ERROR("NptProtectRange: Cannot map PDPT PA 0x%llX", pdptPa);
-      return STATUS_UNSUCCESSFUL;
-    }
-
-    if (!(pdpt[pdptIdx] & NPT_PRESENT)) {
-      HV_LOG_ERROR("NptProtectRange: PDPT[%u] not present for GPA 0x%llX",
-                   pdptIdx, gpa);
+    if (!pdpt || !(pdpt[pdptIdx] & NPT_PRESENT)) {
+      HV_LOG_ERROR("NptProtectRange: PDPT[%u] invalid for GPA 0x%llX", pdptIdx,
+                   curGpa);
       return STATUS_UNSUCCESSFUL;
     }
 
@@ -77,29 +76,48 @@ NTSTATUS NptProtectRange(_In_ PNPT_CONTEXT NptCtx,
       return STATUS_UNSUCCESSFUL;
     }
 
-    /* --- Backup original PDE and clear PRESENT bit --- */
-    UINT64 originalPde = pd[pdIdx];
-    if (!(originalPde & NPT_PRESENT)) {
-      HV_LOG("NptProtectRange: PD[%u] already non-present for GPA 0x%llX",
-             pdIdx, gpa);
-      continue; /* Already protected or unmapped */
+    /* --- Check for Large Page (2MB) at PD level --- */
+    if (pd[pdIdx] & NPT_LARGE_PAGE) {
+      /* Split 2MB page into 4KB pages */
+      /* Note: passing 2MB-aligned base for splitting */
+      UINT64 largePageBase = curGpa & ~(NPT_PAGE_SIZE_2MB - 1);
+      NTSTATUS status = NptSplitLargePage(NptCtx, &pd[pdIdx], largePageBase);
+      if (!NT_SUCCESS(status)) {
+        HV_LOG_ERROR(
+            "NptProtectRange: Failed to split large page at 0x%llX (status=0x%08X)",
+            largePageBase, status);
+        return status;
+      }
     }
 
-    /* Clear PRESENT bit (guest cannot access this page) */
-    pd[pdIdx] = originalPde & ~NPT_PRESENT;
+    /* --- Walk to PT level --- */
+    /* PD entry now points to a Page Table (guaranteed present/alloc'd by split
+     * or existing) */
+    if (!(pd[pdIdx] & NPT_PRESENT)) {
+        /* Should not happen after split/check */
+         HV_LOG_ERROR("NptProtectRange: PD[%u] not present after split logic", pdIdx);
+         return STATUS_UNSUCCESSFUL;
+    }
 
-    /* Record protected range for cleanup */
-    UINT32 idx = ProtCtx->RangeCount++;
-    ProtCtx->Ranges[idx].Gpa = gpa;
-    ProtCtx->Ranges[idx].Size = NPT_PAGE_SIZE_2MB;
-    ProtCtx->Ranges[idx].OriginalPde = originalPde;
-    ProtCtx->Ranges[idx].PdIndex = pdIdx;
-    ProtCtx->Ranges[idx].PdptIndex = pdptIdx;
-    ProtCtx->Ranges[idx].Pml4Index = pml4Idx;
+    UINT64 ptPa = pd[pdIdx] & NPT_PFN_MASK;
+    pa.QuadPart = (LONGLONG)ptPa;
+    PNPT_ENTRY pt = (PNPT_ENTRY)MmGetVirtualForPhysical(pa);
+    if (!pt) {
+      HV_LOG_ERROR("NptProtectRange: Cannot map PT PA 0x%llX", ptPa);
+      return STATUS_UNSUCCESSFUL;
+    }
 
-    HV_LOG("  Protected 2MB page at GPA 0x%llX (PML4[%u] PDPT[%u] PD[%u])",
-           gpa, pml4Idx, pdptIdx, pdIdx);
+    /* --- Protect 4KB PTE --- */
+    /* Clear PRESENT bit */
+    if (pt[ptIdx] & NPT_PRESENT) {
+        pt[ptIdx] &= ~NPT_PRESENT;
+    }
   }
+
+  /* Record protected range */
+  UINT32 idx = ProtCtx->RangeCount++;
+  ProtCtx->Ranges[idx].Gpa = gpaAligned;
+  ProtCtx->Ranges[idx].Size = sizeAligned;
 
   return STATUS_SUCCESS;
 }
@@ -117,45 +135,64 @@ NTSTATUS NptUnprotectRange(_In_ PNPT_CONTEXT NptCtx,
     return STATUS_INVALID_PARAMETER;
   }
 
-  UINT64 gpaAligned = Gpa & ~(NPT_PAGE_SIZE_2MB - 1);
+  /* Align based on our internal usage (4KB) */
+  UINT64 gpaAligned = Gpa & ~(NPT_PAGE_SIZE_4KB - 1);
 
   /* Find the protected range */
+  /* Note: Simple search. Could be optimized if needed. */
   for (UINT32 i = 0; i < ProtCtx->RangeCount; i++) {
     if (ProtCtx->Ranges[i].Gpa == gpaAligned) {
       PPROTECTED_RANGE range = &ProtCtx->Ranges[i];
+      UINT64 endGpa = range->Gpa + range->Size;
 
-      /* Walk to PD and restore original PDE */
-      PNPT_ENTRY pml4 = NptCtx->Pml4;
-      UINT64 pdptPa = pml4[range->Pml4Index] & NPT_PFN_MASK;
-      PHYSICAL_ADDRESS pa;
-      pa.QuadPart = (LONGLONG)pdptPa;
-      PNPT_ENTRY pdpt = (PNPT_ENTRY)MmGetVirtualForPhysical(pa);
-      if (!pdpt)
-        return STATUS_UNSUCCESSFUL;
+      /* Walk pages and restore PRESENT bit */
+      for (UINT64 curGpa = range->Gpa; curGpa < endGpa;
+           curGpa += NPT_PAGE_SIZE_4KB) {
+        
+        UINT32 pml4Idx = (UINT32)NPT_PML4_INDEX(curGpa);
+        UINT32 pdptIdx = (UINT32)NPT_PDPT_INDEX(curGpa);
+        UINT32 pdIdx = (UINT32)NPT_PD_INDEX(curGpa);
+        UINT32 ptIdx = (UINT32)NPT_PT_INDEX(curGpa);
 
-      UINT64 pdPa = pdpt[range->PdptIndex] & NPT_PFN_MASK;
-      pa.QuadPart = (LONGLONG)pdPa;
-      PNPT_ENTRY pd = (PNPT_ENTRY)MmGetVirtualForPhysical(pa);
-      if (!pd)
-        return STATUS_UNSUCCESSFUL;
+        /* Walk NPT (assume structure exists as we protected it) */
+        PNPT_ENTRY pml4 = NptCtx->Pml4;
+        UINT64 pdptPa = pml4[pml4Idx] & NPT_PFN_MASK;
+        PHYSICAL_ADDRESS pa;
+        pa.QuadPart = (LONGLONG)pdptPa;
+        PNPT_ENTRY pdpt = (PNPT_ENTRY)MmGetVirtualForPhysical(pa);
+        if (!pdpt) continue;
 
-      /* Restore original PDE */
-      pd[range->PdIndex] = range->OriginalPde;
+        UINT64 pdPa = pdpt[pdptIdx] & NPT_PFN_MASK;
+        pa.QuadPart = (LONGLONG)pdPa;
+        PNPT_ENTRY pd = (PNPT_ENTRY)MmGetVirtualForPhysical(pa);
+        if (!pd) continue;
 
-      HV_LOG("NptUnprotectRange: Restored GPA 0x%llX", gpaAligned);
+        /* We expect a Page Table here now (split) */
+        if (pd[pdIdx] & NPT_LARGE_PAGE) {
+            /* Should not happen if we split it during protection */
+            continue; 
+        }
 
-      /* Remove from list (shift remaining entries) */
-      for (UINT32 j = i; j < ProtCtx->RangeCount - 1; j++) {
-        ProtCtx->Ranges[j] = ProtCtx->Ranges[j + 1];
+        UINT64 ptPa = pd[pdIdx] & NPT_PFN_MASK;
+        pa.QuadPart = (LONGLONG)ptPa;
+        PNPT_ENTRY pt = (PNPT_ENTRY)MmGetVirtualForPhysical(pa);
+        if (!pt) continue;
+
+        /* Restore PRESENT bit */
+        pt[ptIdx] |= NPT_PRESENT;
       }
+
+      HV_LOG("NptUnprotectRange: Restored range at GPA 0x%llX (Size 0x%llX)",
+             range->Gpa, range->Size);
+
+      /* Remove from list */
+      ProtCtx->Ranges[i] = ProtCtx->Ranges[ProtCtx->RangeCount - 1];
       ProtCtx->RangeCount--;
 
       return STATUS_SUCCESS;
     }
   }
 
-  HV_LOG_ERROR("NptUnprotectRange: GPA 0x%llX not found in protected ranges",
-               gpaAligned);
   return STATUS_NOT_FOUND;
 }
 
@@ -240,24 +277,42 @@ VOID NptUnprotectAll(_In_ PNPT_CONTEXT NptCtx,
 
   HV_LOG("NptUnprotectAll: Restoring %u protected ranges", ProtCtx->RangeCount);
 
-  /* Unprotect in reverse order (LIFO) */
   while (ProtCtx->RangeCount > 0) {
-    UINT32 idx = ProtCtx->RangeCount - 1;
-    PPROTECTED_RANGE range = &ProtCtx->Ranges[idx];
+    PPROTECTED_RANGE range = &ProtCtx->Ranges[ProtCtx->RangeCount - 1];
+    
+    /* Reuse UnprotectRange logic (inefficient but safe/simple) */
+    /* Or inline it to avoid search overhead, but search is checked by index anyway in Unprotect if we pass index?
+       No, Unprotect takes GPA. 
+       Let's just implement the loop here. */
+    
+    UINT64 endGpa = range->Gpa + range->Size;
+    for (UINT64 curGpa = range->Gpa; curGpa < endGpa; curGpa += NPT_PAGE_SIZE_4KB) {
+        UINT32 pml4Idx = (UINT32)NPT_PML4_INDEX(curGpa);
+        UINT32 pdptIdx = (UINT32)NPT_PDPT_INDEX(curGpa);
+        UINT32 pdIdx = (UINT32)NPT_PD_INDEX(curGpa);
+        UINT32 ptIdx = (UINT32)NPT_PT_INDEX(curGpa);
 
-    /* Walk to PD and restore original PDE */
-    PNPT_ENTRY pml4 = NptCtx->Pml4;
-    UINT64 pdptPa = pml4[range->Pml4Index] & NPT_PFN_MASK;
-    PHYSICAL_ADDRESS pa;
-    pa.QuadPart = (LONGLONG)pdptPa;
-    PNPT_ENTRY pdpt = (PNPT_ENTRY)MmGetVirtualForPhysical(pa);
-    if (pdpt) {
-      UINT64 pdPa = pdpt[range->PdptIndex] & NPT_PFN_MASK;
-      pa.QuadPart = (LONGLONG)pdPa;
-      PNPT_ENTRY pd = (PNPT_ENTRY)MmGetVirtualForPhysical(pa);
-      if (pd) {
-        pd[range->PdIndex] = range->OriginalPde;
-      }
+        PNPT_ENTRY pml4 = NptCtx->Pml4;
+        if (!pml4) break;
+        
+        UINT64 pdptPa = pml4[pml4Idx] & NPT_PFN_MASK;
+        PHYSICAL_ADDRESS pa; pa.QuadPart = (LONGLONG)pdptPa;
+        PNPT_ENTRY pdpt = (PNPT_ENTRY)MmGetVirtualForPhysical(pa);
+        if (!pdpt) continue;
+
+        UINT64 pdPa = pdpt[pdptIdx] & NPT_PFN_MASK;
+        pa.QuadPart = (LONGLONG)pdPa;
+        PNPT_ENTRY pd = (PNPT_ENTRY)MmGetVirtualForPhysical(pa);
+        if (!pd) continue;
+
+        if (pd[pdIdx] & NPT_LARGE_PAGE) continue;
+
+        UINT64 ptPa = pd[pdIdx] & NPT_PFN_MASK;
+        pa.QuadPart = (LONGLONG)ptPa;
+        PNPT_ENTRY pt = (PNPT_ENTRY)MmGetVirtualForPhysical(pa);
+        if (!pt) continue;
+
+        pt[ptIdx] |= NPT_PRESENT;
     }
 
     ProtCtx->RangeCount--;

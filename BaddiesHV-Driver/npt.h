@@ -177,4 +177,13 @@ NTSTATUS NptBuildIdentityMap(_Out_ PNPT_CONTEXT NptCtx);
  */
 VOID NptDestroyIdentityMap(_Inout_ PNPT_CONTEXT NptCtx);
 
+/*
+ * NptSplitLargePage — Split a 2MB large page into 512 4KB pages.
+ *
+ * Allocates a new page table, fills it with 4KB entries mapping the
+ * same 2MB range, and updates the PDE to point to the new table.
+ */
+NTSTATUS NptSplitLargePage(_In_ PNPT_CONTEXT NptCtx, _In_ PNPT_ENTRY Pde,
+                           _In_ UINT64 GpaBase);
+
 #endif /* NPT_H */
