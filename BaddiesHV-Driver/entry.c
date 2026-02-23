@@ -32,8 +32,7 @@
 static VOID BhvDriverUnload(_In_ PDRIVER_OBJECT DriverObject) {
   UNREFERENCED_PARAMETER(DriverObject);
 
-  HV_LOG("DriverUnload — shutting down alloc worker...");
-  HvAllocWorkerShutdown();
+  /* AllocWorker is DISABLED — nothing to shut down */
 
   HV_LOG("DriverUnload — beginning devirtualize...");
   SvmDevirtualizeAllProcessors();
@@ -94,16 +93,12 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject,
   }
   HV_LOG("Step 2: PASSED — All processors subverted");
 
-  /* Step 3: Start alloc worker thread */
-  HV_LOG("Step 3: Starting alloc worker thread...");
-  status = HvAllocWorkerInit();
-  if (!NT_SUCCESS(status)) {
-    HV_LOG_ERROR("Alloc worker init failed (0x%08X) — injection unavailable",
-                 status);
-    /* Non-fatal — HV still works for R/W, just can't alloc */
-  } else {
-    HV_LOG("Step 3: PASSED — Alloc worker thread active");
-  }
+  /* Step 3: Alloc worker DISABLED.
+   * The polling worker thread added a background timer at PASSIVE_LEVEL
+   * that interfered with system stability during testing.
+   * HV_CMD_ALLOC / HV_CMD_READ_SAFE / HV_CMD_WRITE_SAFE / HV_CMD_UNLOCK_MDL
+   * will return HV_STATUS_NOT_IMPLEMENTED while disabled. */
+  HV_LOG("Step 3: AllocWorker DISABLED — injection/deferred-ops unavailable");
 
   HV_LOG("========================================");
   HV_LOG("  BaddiesHV is ACTIVE                   ");

@@ -401,6 +401,15 @@ NTSTATUS SvmInitializeVcpu(_In_ ULONG ProcessorIndex,
     UINT32 limitLow;
     UINT64 baseLow;
 
+    /* GDT segment descriptor base field layout (Intel/AMD manual):
+     *   base[7:0]   = entry[2]
+     *   base[15:8]  = entry[3]
+     *   base[23:16] = entry[4]   <-- middle byte, was previously missing
+     *   base[31:24] = entry[7]
+     * Omitting entry[4] gives wrong base for non-flat segments (TR, LDT, etc.).
+     * In 64-bit flat mode CS/SS base happens to be 0 so entry[4]=0 is benign,
+     * but for correctness we always include it. */
+
     /* --- CS --- */
     sel = AsmReadCs();
     idx = sel >> 3;
@@ -409,8 +418,8 @@ NTSTATUS SvmInitializeVcpu(_In_ ULONG ProcessorIndex,
     flagsNibble = (entry[6] >> 4) & 0x0F;
     limitLow = (UINT32)entry[0] | ((UINT32)entry[1] << 8) |
                ((UINT32)(entry[6] & 0x0F) << 16);
-    baseLow =
-        (UINT64)entry[2] | ((UINT64)entry[3] << 8) | ((UINT64)entry[7] << 24);
+    baseLow = (UINT64)entry[2] | ((UINT64)entry[3] << 8) |
+              ((UINT64)entry[4] << 16) | ((UINT64)entry[7] << 24);
     state->Cs.Selector = sel;
     state->Cs.Attrib = (UINT16)((flagsNibble << 8) | accessByte);
     state->Cs.Limit =
@@ -425,8 +434,8 @@ NTSTATUS SvmInitializeVcpu(_In_ ULONG ProcessorIndex,
     flagsNibble = (entry[6] >> 4) & 0x0F;
     limitLow = (UINT32)entry[0] | ((UINT32)entry[1] << 8) |
                ((UINT32)(entry[6] & 0x0F) << 16);
-    baseLow =
-        (UINT64)entry[2] | ((UINT64)entry[3] << 8) | ((UINT64)entry[7] << 24);
+    baseLow = (UINT64)entry[2] | ((UINT64)entry[3] << 8) |
+              ((UINT64)entry[4] << 16) | ((UINT64)entry[7] << 24);
     state->Ss.Selector = sel;
     state->Ss.Attrib = (UINT16)((flagsNibble << 8) | accessByte);
     state->Ss.Limit =
@@ -442,8 +451,8 @@ NTSTATUS SvmInitializeVcpu(_In_ ULONG ProcessorIndex,
       flagsNibble = (entry[6] >> 4) & 0x0F;
       limitLow = (UINT32)entry[0] | ((UINT32)entry[1] << 8) |
                  ((UINT32)(entry[6] & 0x0F) << 16);
-      baseLow =
-          (UINT64)entry[2] | ((UINT64)entry[3] << 8) | ((UINT64)entry[7] << 24);
+      baseLow = (UINT64)entry[2] | ((UINT64)entry[3] << 8) |
+                ((UINT64)entry[4] << 16) | ((UINT64)entry[7] << 24);
       state->Ds.Selector = sel;
       state->Ds.Attrib = (UINT16)((flagsNibble << 8) | accessByte);
       state->Ds.Limit =
@@ -466,8 +475,8 @@ NTSTATUS SvmInitializeVcpu(_In_ ULONG ProcessorIndex,
       flagsNibble = (entry[6] >> 4) & 0x0F;
       limitLow = (UINT32)entry[0] | ((UINT32)entry[1] << 8) |
                  ((UINT32)(entry[6] & 0x0F) << 16);
-      baseLow =
-          (UINT64)entry[2] | ((UINT64)entry[3] << 8) | ((UINT64)entry[7] << 24);
+      baseLow = (UINT64)entry[2] | ((UINT64)entry[3] << 8) |
+                ((UINT64)entry[4] << 16) | ((UINT64)entry[7] << 24);
       state->Es.Selector = sel;
       state->Es.Attrib = (UINT16)((flagsNibble << 8) | accessByte);
       state->Es.Limit =
@@ -716,15 +725,16 @@ static VOID HandleMsr(_In_ PVCPU_DATA Vcpu, _Inout_ PGUEST_CONTEXT GuestCtx) {
 
     switch (msrIndex) {
     case MSR_EFER:
-      /* Shadow the write: update the virtual EFER, and pass through
-       * the real write with SVME always set (we need it enabled). */
-      Vcpu->VirtualEfer = msrValue & ~EFER_SVME; /* Client-visible version */
-
-      /* The actual EFER write to hardware must preserve SVME */
-      msrValue |= EFER_SVME;
+      /* Shadow the write: keep a client-visible EFER without SVME, and
+       * update the VMCB's StateSave.Efer with SVME forced on.
+       *
+       * NOTE: We intentionally do NOT call __writemsr(MSR_EFER, ...) here.
+       * On AMD SVM the guest EFER is taken from VMCB.StateSave.Efer on
+       * each VMRUN — the hardware MSR reflects the HOST EFER, not the guest.
+       * Writing the VMCB field is the correct and only required action. */
+      Vcpu->VirtualEfer = msrValue & ~EFER_SVME; /* Guest-visible (SVME hidden) */
+      msrValue |= EFER_SVME;                     /* Host must keep SVME=1      */
       Vcpu->GuestVmcb->StateSave.Efer = msrValue;
-      HV_LOG("CPU %u: WRMSR EFER — shadow=0x%llX, actual=0x%llX",
-             Vcpu->ProcessorIndex, Vcpu->VirtualEfer, msrValue);
       break;
 
     default:
@@ -798,14 +808,18 @@ static VOID HandleUnknownExit(_In_ PVCPU_DATA Vcpu,
                               _Inout_ PGUEST_CONTEXT GuestCtx) {
   UNREFERENCED_PARAMETER(GuestCtx);
 
-  /* Try to advance RIP past the faulting instruction */
+  /* Advance RIP only when we have an explicit instruction length.
+   * Non-instruction VMEXITs (INTR, NMI, NPF, SHUTDOWN, etc.) have
+   * InsnLen=0 and NextRip=0 — advancing RIP for those would corrupt
+   * the guest instruction stream and cause an immediate crash.
+   * Falling through without advancing is safe: the guest will re-run
+   * the triggering instruction (or re-raise the event). */
   if (g_HvData.NripSaveSupported && Vcpu->GuestVmcb->Control.NextRip != 0) {
     Vcpu->GuestVmcb->StateSave.Rip = Vcpu->GuestVmcb->Control.NextRip;
   } else if (Vcpu->GuestVmcb->Control.InsnLen != 0) {
     Vcpu->GuestVmcb->StateSave.Rip += Vcpu->GuestVmcb->Control.InsnLen;
-  } else {
-    Vcpu->GuestVmcb->StateSave.Rip += 3;
   }
+  /* else: do NOT advance — non-instruction exit, let guest retry */
 
   /* Safety valve: count unknown exits and devirtualize if too many */
   UINT32 idx = Vcpu->ProcessorIndex & 0xFF;
@@ -892,9 +906,6 @@ BOOLEAN SvmVmexitHandler(_Inout_ PVCPU_DATA Vcpu,
      */
     return TRUE;
   }
-
-  /* Reset TLB control (prevent flush storm) */
-  Vcpu->GuestVmcb->Control.TlbControl = TLB_CONTROL_DO_NOTHING;
 
   exitCode = Vcpu->GuestVmcb->Control.ExitCode;
 
@@ -1211,94 +1222,22 @@ BOOLEAN SvmVmexitHandler(_Inout_ PVCPU_DATA Vcpu,
         break;
       }
 
-      case HV_CMD_READ_SAFE: {
-        /* Deferred read via worker thread — for file-backed pages that
-         * may not be resident.  Worker runs at PASSIVE_LEVEL where
-         * page faults are handled normally by the OS. */
-        if (!Vcpu->SharedPageRegistered) {
-          GuestCtx->Rax = HV_STATUS_NOT_REGISTERED;
-          break;
-        }
-
-        UINT64 hostCr3 = __readcr3();
-        volatile HV_SHARED_PAGE *sp =
-            (volatile HV_SHARED_PAGE *)Vcpu->SharedPageVa;
-
-        __writecr3(Vcpu->SharedPageCr3);
-        UINT64 magic = sp->request.magic;
-        UINT32 reqPid = sp->request.pid;
-        UINT64 reqAddr = sp->request.address;
-        UINT64 reqSize = sp->request.size;
-        __writecr3(hostCr3);
-
-        if (magic != HV_MAGIC) {
-          GuestCtx->Rax = HV_STATUS_INVALID_MAGIC;
-          break;
-        }
-
-        if (reqSize > HV_DATA_SIZE)
-          reqSize = HV_DATA_SIZE;
-
-        g_HvData.DeferReadPid = reqPid;
-        g_HvData.DeferReadAddr = reqAddr;
-        g_HvData.DeferReadSize = reqSize;
-        InterlockedExchange(&g_HvData.DeferReadStatus, 0);
-        InterlockedExchange(&g_HvData.DeferReadReady, 1);
-
-        GuestCtx->Rax = HV_STATUS_PENDING;
+      case HV_CMD_READ_SAFE:
+        /* AllocWorker is DISABLED — deferred read unavailable.
+         * Returning NOT_IMPLEMENTED prevents the guest from hanging
+         * forever waiting for a worker that will never consume the request. */
+        GuestCtx->Rax = HV_STATUS_NOT_IMPLEMENTED;
         break;
-      }
 
-      case HV_CMD_WRITE_SAFE: {
-        /* Deferred write via worker thread — worker runs at PASSIVE_LEVEL
-         * where page faults are handled normally. */
-        if (!Vcpu->SharedPageRegistered) {
-          GuestCtx->Rax = HV_STATUS_NOT_REGISTERED;
-          break;
-        }
-
-        UINT64 hostCr3 = __readcr3();
-        volatile HV_SHARED_PAGE *sp =
-            (volatile HV_SHARED_PAGE *)Vcpu->SharedPageVa;
-
-        __writecr3(Vcpu->SharedPageCr3);
-
-        UINT64 magic = sp->request.magic;
-        UINT32 reqPid = sp->request.pid;
-        UINT64 reqAddr = sp->request.address;
-        UINT64 reqSize = sp->request.size;
-
-        /* Copy write data from shared page to kernel buffer.
-         * Use __movsb (REP MOVSB) — single instruction, not a
-         * volatile byte-by-byte loop that generates thousands of
-         * individual memory ops under CR3 swap (crashes VMware). */
-        if (reqSize > HV_DATA_SIZE)
-          reqSize = HV_DATA_SIZE;
-        __movsb(g_HvData.DeferWriteBuf, (const UINT8 *)sp->data,
-                (size_t)reqSize);
-        __writecr3(hostCr3);
-
-        if (magic != HV_MAGIC) {
-          GuestCtx->Rax = HV_STATUS_INVALID_MAGIC;
-          break;
-        }
-
-        g_HvData.DeferWritePid = reqPid;
-        g_HvData.DeferWriteAddr = reqAddr;
-        g_HvData.DeferWriteSize = reqSize;
-        InterlockedExchange(&g_HvData.DeferWriteStatus, 0);
-        InterlockedExchange(&g_HvData.DeferWriteReady, 1);
-
-        GuestCtx->Rax = HV_STATUS_PENDING;
+      case HV_CMD_WRITE_SAFE:
+        /* AllocWorker is DISABLED — deferred write unavailable. */
+        GuestCtx->Rax = HV_STATUS_NOT_IMPLEMENTED;
         break;
-      }
-      case HV_CMD_UNLOCK_MDL: {
-        /* Signal the worker thread to release MDL-locked allocation pages.
-         * MmUnlockPages must run at PASSIVE_LEVEL, not VMEXIT context. */
-        InterlockedExchange(&g_HvData.UnlockMdlReady, 1);
-        GuestCtx->Rax = HV_STATUS_SUCCESS;
+
+      case HV_CMD_UNLOCK_MDL:
+        /* AllocWorker is DISABLED — no MDL will ever be allocated. */
+        GuestCtx->Rax = HV_STATUS_NOT_IMPLEMENTED;
         break;
-      }
 
       case HV_CMD_DEVIRT:
         g_HvData.DevirtualizeFlag = TRUE;
@@ -1381,7 +1320,15 @@ BOOLEAN SvmVmexitHandler(_Inout_ PVCPU_DATA Vcpu,
     break;
   }
 
+  case VMEXIT_INTR:
+    /* External interrupt — hardware delivered it to the host.
+     * No RIP advance needed: this is not an instruction exit.
+     * The interrupt handler ran on the host; just re-enter the guest. */
+    break;
+
   case VMEXIT_NMI:
+    /* Re-inject NMI into guest so the OS watchdog/crash-dump handler
+     * can process it. No RIP advance. */
     Vcpu->GuestVmcb->Control.EventInj = EVENTINJ_NMI_INJECT;
     break;
 
@@ -1422,10 +1369,16 @@ BOOLEAN SvmVmexitHandler(_Inout_ PVCPU_DATA Vcpu,
     */
 
     /* Inject #PF into guest — let OS handle it as a normal page fault.
-     * Set CR2 to the faulting GPA so guest #PF handler sees it. */
+     * Set CR2 to the faulting GPA so guest #PF handler sees it.
+     *
+     * EVENTINJ bits[63:32] = error code (must be masked to 32 bits).
+     * ExitInfo1 for NPF contains NPT-specific flags above bit 4 that are
+     * not part of the #PF error code — masking to low 32 bits prevents
+     * setting reserved bits in the EventInj field. */
+    UINT64 pfErrorCode = errorCode & 0xFFFFFFFFULL;
     Vcpu->GuestVmcb->Control.EventInj =
-        EVENTINJ_VALID | EVENTINJ_TYPE_EXCEPTION | 14 | EVENTINJ_ERROR_VALID;
-    Vcpu->GuestVmcb->Control.EventInj |= (errorCode << 32);
+        EVENTINJ_VALID | EVENTINJ_TYPE_EXCEPTION | 14 | EVENTINJ_ERROR_VALID |
+        (pfErrorCode << 32);
     Vcpu->GuestVmcb->StateSave.Cr2 = faultGpa;
 
     /* Do NOT advance RIP — #PF handler will retry the instruction */
@@ -1434,15 +1387,25 @@ BOOLEAN SvmVmexitHandler(_Inout_ PVCPU_DATA Vcpu,
 
 
   default:
-    /* Unknown: try to advance RIP and continue */
+    /* Unknown exit: advance RIP only when an explicit instruction length
+     * is available. Do NOT use a hardcoded fallback (e.g. +=3) — that
+     * corrupts the instruction stream for non-instruction exits such as
+     * VMEXIT_INTR (0x60), VMEXIT_NMI (0x61), VMEXIT_SHUTDOWN (0x7F). */
     if (Vcpu->GuestVmcb->Control.NextRip != 0)
       Vcpu->GuestVmcb->StateSave.Rip = Vcpu->GuestVmcb->Control.NextRip;
     else if (Vcpu->GuestVmcb->Control.InsnLen != 0)
       Vcpu->GuestVmcb->StateSave.Rip += Vcpu->GuestVmcb->Control.InsnLen;
-    else
-      Vcpu->GuestVmcb->StateSave.Rip += 3;
+    /* else: do NOT advance — non-instruction exit */
     break;
   }
+
+  /*
+   * Reset TLB control AFTER the handler has run.
+   * Moving it here (was at top of handler) allows individual exit handlers
+   * to set TlbControl = FLUSH_ASID/FLUSH_ALL when they modify NPT PTEs —
+   * the flush then takes effect on the immediately following VMRUN.
+   */
+  Vcpu->GuestVmcb->Control.TlbControl = TLB_CONTROL_DO_NOTHING;
 
   /*
    * Anti-detection: subtract VMEXIT handler time from guest-visible TSC.
@@ -1628,7 +1591,7 @@ static VOID SvmSubvertProcessorDpc(_In_ PKDPC Dpc,
     layout->VcpuData = (UINT64)vcpu;
     layout->OriginalRsp = 0; /* Filled by ASM prologue */
     layout->Padding1 = 0;
-    layout->Padding2 = 0;
+    layout->Padding2 = 0; /* alignment — see HOST_STACK_LAYOUT comment */
 
     /* NOTE: RIP/RSP are set by SvmLaunchVm assembly code (lines 104-106)
      * to @@GuestEntry and OriginalRsp before the first VMRUN. */
@@ -1661,7 +1624,10 @@ static VOID SvmSubvertProcessorDpc(_In_ PKDPC Dpc,
     __writemsr(MSR_VM_HSAVE_PA, 0);
 
     vcpu->Subverted = FALSE;
-    InterlockedIncrement(&g_HvData.DevirtualizedCount);
+    /* BUG FIX: Do NOT increment DevirtualizedCount here.
+     * SvmVmexitHandler already incremented it when it returned TRUE.
+     * The previous double-increment caused SvmDevirtualizeAllProcessors
+     * to think all CPUs had exited after only half of them had. */
 
     /* NOT in a DPC — do not call KeSignalCallDpc* */
     return;

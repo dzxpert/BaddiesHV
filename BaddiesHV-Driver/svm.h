@@ -259,11 +259,11 @@ KeSignalCallDpcSynchronize(_In_ PVOID SystemArgument2);
  *  AMD APM Vol 2, Appendix C
  * ============================================================================
  */
-#define VMEXIT_INTR        0x60  /* External interrupt (INTR) */
-#define VMEXIT_NMI         0x61  /* Non-Maskable Interrupt */
-#define VMEXIT_CPUID       0x72  /* CPUID instruction */
-#define VMEXIT_VMMCALL     0x81  /* VMMCALL instruction */
-#define VMEXIT_NPF         0x400 /* Nested Page Fault */
+/*
+ * Note: VMEXIT exit codes are already defined above as part of the full
+ * VMEXIT code table (lines 104–192). The second block that previously
+ * appeared here was a duplicate and has been removed to prevent shadowing.
+ */
 
 /* ============================================================================
  *  VMCB Clean Bits — offset 0x0C0 in the control area
@@ -675,8 +675,18 @@ typedef struct _HOST_STACK_LAYOUT {
   UINT64 VcpuData;    /* cast to PVCPU_DATA in handler */
   UINT64 OriginalRsp; /* caller's stack for return */
   UINT64 Padding1;    /* alignment padding */
-  UINT64 Padding2;    /* sizeof = 48 = 0x30, mod 16 = 0 */
+  UINT64 Padding2;    /* CRITICAL: keeps sizeof == 0x30 so that the ASM stack
+                       * frame is correctly aligned. The ASM loop does:
+                       *   mov rsp, layout  (rsp = stackTop - sizeof)
+                       *   sub rsp, 0x100
+                       * For x64 CALL alignment RSP must be 0 mod 16 at the
+                       * call site. stackTop is 16-byte aligned, so we need
+                       * (sizeof + 0x100) mod 16 == 0.  0x30 + 0x100 = 0x130,
+                       * 0x130 mod 16 = 0. Removing this field gives 0x128
+                       * mod 16 = 8 → misaligned stack → BSOD 0x139. */
 } HOST_STACK_LAYOUT, *PHOST_STACK_LAYOUT;
+
+C_ASSERT(sizeof(HOST_STACK_LAYOUT) == 0x30); /* 6 × UINT64; alignment-critical — see Padding2 comment */
 
 /* Maximum cached CR3 entries (covering typically active processes) */
 #define CR3_CACHE_MAX_ENTRIES 64

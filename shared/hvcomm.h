@@ -94,6 +94,7 @@ typedef int64_t INT64;
 #define HV_STATUS_ALLOC_FAILED 0x80000008
 #define HV_STATUS_MODULE_NOT_FOUND 0x80000009
 #define HV_STATUS_PENDING 0x00000010 /* Deferred op in progress   */
+#define HV_STATUS_NOT_IMPLEMENTED 0x8000000A /* Command disabled/unavailable */
 
 /* ============================================================================
  * HV_REQUEST — The command structure written to the shared page.

@@ -27,7 +27,7 @@ VMCB_RSP        EQU 5D8h
 
 ; VCPU_DATA field offsets
 VCPU_VMCB_VA    EQU 0
-VCPU_HOST_PA    EQU 18h
+; Note: host VMCB PA is accessed via HSL_HOST_PA (stack layout), not VCPU directly.
 
 ; HOST_STACK_LAYOUT offsets (from base RSP = top of host stack data)
 HSL_VMCB_PA     EQU 0
@@ -112,7 +112,12 @@ SvmLaunchVm PROC
     ; Allocate frame below HSL for GUEST_CONTEXT, XMM save, shadow space
     sub     rsp, FRAME_BELOW       ; RSP mod 16 = 0 (256 mod 16 = 0)
 
-    ; Zero GUEST_CONTEXT
+    ; Zero GUEST_CONTEXT (128 bytes = 16 qwords)
+    ; cld is REQUIRED: we arrive here via stack switch, not a normal CALL,
+    ; so DF reflects whatever guest RFLAGS had at the VMEXIT.  If the guest
+    ; had DF=1 (inside a std/rep-movs block), rep stosq would fill BACKWARDS
+    ; and corrupt the host stack.  Always clear DF explicitly.
+    cld
     lea     rdi, [rsp + GUEST_CTX]
     xor     eax, eax
     mov     ecx, 128 / 8

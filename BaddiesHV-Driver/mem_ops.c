@@ -313,12 +313,42 @@ HvReadProcessMemory(_In_ PVCPU_DATA Vcpu, _In_ UINT32 Pid, _In_ UINT64 GuestVa,
   if (!NT_SUCCESS(status))
     return status;
 
-  UINT64 hostCr3 = __readcr3();
-  __writecr3(targetCr3);
-  for (UINT64 i = 0; i < Size; i++) {
-    DataBuffer[i] = *(volatile UINT8 *)(GuestVa + i);
+  /* BUG FIX: Use HvTranslateGuestVa + MmGetVirtualForPhysical instead of
+   * raw CR3 swap with direct dereference.
+   *
+   * Why the old approach crashes:
+   *   __writecr3(targetCr3); ptr dereference;
+   *   If the target page is demand-zeroed or paged out, the hardware raises
+   *   a page fault. At DIRQL/GIF=0 there is no page fault handler —
+   *   the CPU triple-faults and the system reboots.
+   *
+   * New approach: walk guest page tables (always-resident MmGetVirtualForPhysical
+   * on PTE pages) to get the physical address, then map it via
+   * MmGetVirtualForPhysical to get a kernel VA that is always resident.
+   * No page fault is possible at any step. */
+  for (UINT64 i = 0; i < Size; ) {
+    UINT64 srcVa  = GuestVa + i;
+    UINT64 pageOff = srcVa & 0xFFF;
+    UINT64 chunk   = 0x1000 - pageOff; /* bytes remaining in this 4KB page */
+    if (chunk > (Size - i))
+      chunk = Size - i;
+
+    UINT64 gpa;
+    status = HvTranslateGuestVa(targetCr3, srcVa, &gpa);
+    if (!NT_SUCCESS(status))
+      return STATUS_UNSUCCESSFUL;
+
+    PHYSICAL_ADDRESS pa;
+    pa.QuadPart = (LONGLONG)gpa;
+    volatile UINT8 *hostVa = (volatile UINT8 *)MmGetVirtualForPhysical(pa);
+    if (!hostVa)
+      return STATUS_UNSUCCESSFUL;
+
+    for (UINT64 j = 0; j < chunk; j++)
+      DataBuffer[i + j] = hostVa[j];
+
+    i += chunk;
   }
-  __writecr3(hostCr3);
   return STATUS_SUCCESS;
 }
 
@@ -343,12 +373,31 @@ NTSTATUS HvWriteProcessMemory(_In_ PVCPU_DATA Vcpu, _In_ UINT32 Pid,
   if (!NT_SUCCESS(status))
     return status;
 
-  UINT64 hostCr3 = __readcr3();
-  __writecr3(targetCr3);
-  for (UINT64 i = 0; i < Size; i++) {
-    *(volatile UINT8 *)(GuestVa + i) = DataBuffer[i];
+  /* BUG FIX: Same rationale as HvReadProcessMemory — use page-table walk
+   * instead of raw CR3 swap to prevent BSOD on not-resident pages. */
+  for (UINT64 i = 0; i < Size; ) {
+    UINT64 dstVa   = GuestVa + i;
+    UINT64 pageOff = dstVa & 0xFFF;
+    UINT64 chunk   = 0x1000 - pageOff;
+    if (chunk > (Size - i))
+      chunk = Size - i;
+
+    UINT64 gpa;
+    status = HvTranslateGuestVa(targetCr3, dstVa, &gpa);
+    if (!NT_SUCCESS(status))
+      return STATUS_UNSUCCESSFUL;
+
+    PHYSICAL_ADDRESS pa;
+    pa.QuadPart = (LONGLONG)gpa;
+    volatile UINT8 *hostVa = (volatile UINT8 *)MmGetVirtualForPhysical(pa);
+    if (!hostVa)
+      return STATUS_UNSUCCESSFUL;
+
+    for (UINT64 j = 0; j < chunk; j++)
+      hostVa[j] = DataBuffer[i + j];
+
+    i += chunk;
   }
-  __writecr3(hostCr3);
   return STATUS_SUCCESS;
 }
 
@@ -371,25 +420,37 @@ NTSTATUS HvWriteProcessMemory(_In_ PVCPU_DATA Vcpu, _In_ UINT32 Pid,
  * ============================================================================
  */
 
-/* EPROCESS offset for PEB pointer (x64, Win10/11 22H2) */
-#define EPROCESS_PEB 0x550
+/* Note: PEB offset formerly hardcoded here as 0x550 was WRONG (actual = 0x520
+ * on Win10/11 22H2). All callers now use g_HvData.Offsets.EprocessPeb which
+ * is discovered dynamically at boot via offset_discovery.c. */
 
 static UINT64 Djb2HashWide(UINT64 cr3, UINT64 hostCr3, UINT64 bufferVa,
                            UINT32 lengthBytes) {
   UINT64 hash = 5381;
   UINT32 charCount = lengthBytes / sizeof(UINT16);
   if (charCount > 128)
-    charCount = 128; /* Safety limit */
+    charCount = 128;
 
-  __writecr3(cr3);
+  /* BUG FIX: Replace raw CR3 swap with HvTranslateGuestVa + MmGetVirtualForPhysical.
+   * The UNICODE_STRING.Buffer pointer is a user-mode VA. If the page is not
+   * physically resident a raw dereference under CR3 swap causes a triple fault.
+   * We walk the string one UINT16 at a time, translating each VA to a kernel VA. */
   for (UINT32 i = 0; i < charCount; i++) {
-    UINT16 wch = *(volatile UINT16 *)(bufferVa + i * sizeof(UINT16));
-    /* Lowercase */
+    UINT64 wchVa = bufferVa + (UINT64)i * sizeof(UINT16);
+    UINT64 gpa;
+    if (!NT_SUCCESS(HvTranslateGuestVa(cr3, wchVa, &gpa)))
+      break;
+    PHYSICAL_ADDRESS pa;
+    pa.QuadPart = (LONGLONG)gpa;
+    volatile UINT16 *va = (volatile UINT16 *)MmGetVirtualForPhysical(pa);
+    if (!va)
+      break;
+    UINT16 wch = *va;
     if (wch >= L'A' && wch <= L'Z')
       wch += 32;
     hash = ((hash << 5) + hash) + (UINT64)wch;
   }
-  __writecr3(hostCr3);
+  UNREFERENCED_PARAMETER(hostCr3); /* no longer needed */
   return hash;
 }
 
@@ -426,8 +487,12 @@ NTSTATUS HvFindModuleBase(_In_ PVCPU_DATA Vcpu, _In_ UINT32 Pid,
   UINT64 guestCr3 = Vcpu->GuestVmcb->StateSave.Cr3;
   UINT64 hostCr3 = __readcr3();
 
-  /* Read PEB pointer from EPROCESS */
-  UINT64 pebVa = ReadKernelVa64(guestCr3, hostCr3, eprocessVa + EPROCESS_PEB);
+  /* Read PEB pointer from EPROCESS using dynamically discovered offset.
+   * Using a hardcoded offset (e.g. 0x550) would break across Windows builds
+   * and caused wrong-address reads on this machine (discovered offset
+   * is 0x520 — 0x30 bytes earlier than the old hardcode). */
+  UINT64 pebVa = ReadKernelVa64(guestCr3, hostCr3,
+                                 eprocessVa + g_HvData.Offsets.EprocessPeb);
   if (pebVa == 0)
     return STATUS_NOT_FOUND;
 
