@@ -1,5 +1,9 @@
 # BaddiesHV
 
+<div align=center>
+  <img src="https://media1.tenor.com/m/AGe96QwpTaQAAAAd/shimoneta-hyouka-fuwa.gif" width="600"/>
+</div>
+
 **A stealth AMD-V hypervisor with anti-cheat evasion capabilities**
 
 BaddiesHV is a research-focused, thin AMD SVM (Secure Virtual Machine) hypervisor designed for low-level system interaction and anti-cheat analysis. It provides kernel-mode memory access primitives via CPUID-based hypercalls and includes a complete DLL injection pipeline with DX11 overlay support.
