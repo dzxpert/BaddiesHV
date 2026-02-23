@@ -316,12 +316,20 @@ NTSTATUS SvmInitializeVcpu(_In_ ULONG ProcessorIndex,
    * ------------------------------------------------------------------ */
   PVMCB_CONTROL_AREA ctrl = &vcpu->GuestVmcb->Control;
 
-  /* Intercept CPUID — DISABLED (reference svm.c uses Word3=0, no CPUID VMEXIT).
-   * Intercepting CPUID on every guest cpuid instruction causes a massive VMEXIT
-   * storm during Windows boot (CPUID is called thousands of times per second).
-   * With GIF=0 and no STGI, these exits pile up and starve the scheduler,
-   * triggering the watchdog reboot. Pass CPUID through natively. */
-  // ctrl->InterceptMisc1 |= INTERCEPT_CPUID_;
+  /* Intercept CPUID — REQUIRED for all driver/loader communication.
+   *
+   * The entire hypercall protocol (PING, REGISTER, READ/WRITE, DEVIRT, etc.)
+   * is driven by the loader issuing __cpuidex(regs, HV_CPUID_LEAF, cmd).
+   * Without this bit set the HV never VMEXITs on CPUID and every hypercall
+   * silently falls through to hardware — loader sees random CPU data instead
+   * of HV responses.  HvPing() returns false.  Communication is dead.
+   *
+   * VMEXIT storm concern (why it was disabled): Windows does issue thousands
+   * of CPUID instructions per second, each causing a VMEXIT.  Addressed by
+   * making the non-magic leaf fast-path a zero-kernel-call __cpuidex relay
+   * (see HandleCpuid in SvmVmexitHandler) — ~20 cycles overhead per exit.
+   * This is the same pattern used by SimpleSvm, KVM, and Hyper-V. */
+  ctrl->InterceptMisc1 |= INTERCEPT_CPUID_;
 
   /* Intercept MSR via MSRPM — DISABLED.
    * MSRPM is zeroed (see SvmAllocateMsrpm), so all MSRs pass through.
