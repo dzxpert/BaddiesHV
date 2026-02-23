@@ -205,23 +205,14 @@ NTSTATUS SvmAllocateMsrpm(VOID) {
     return STATUS_INSUFFICIENT_RESOURCES;
   }
 
-  /* Zero out — all MSR accesses pass through by default */
+  /* MSRPM is fully ZEROED — all MSR accesses pass through without VMEXIT.
+   * Reference svm.c confirms: "Zeroed MSRPM = no MSR intercepts = all MSRs
+   * pass through to hardware. This maximizes performance by avoiding
+   * MSR-related VMEXITs."
+   * EFER intercept removed: on AMD SVM, the guest EFER is taken directly from
+   * VMCB.StateSave.Efer on each VMRUN. No need to intercept EFER writes. */
   RtlZeroMemory(g_HvData.MsrPermissionMap, MSRPM_SIZE);
-
-  /* Set intercepts for SVM-related MSRs */
-  PUINT8 msrpm = (PUINT8)g_HvData.MsrPermissionMap;
-
-  /* EFER (0xC0000080) — intercept both reads and writes to shadow SVME */
-  MsrpmSetIntercept(msrpm, (UINT32)MSR_EFER, TRUE, TRUE);
-
-  /* VM_CR (0xC0010114) — intercept reads (hide SVM state) */
-  MsrpmSetIntercept(msrpm, (UINT32)MSR_VM_CR, TRUE, FALSE);
-
-  /* VM_HSAVE_PA (0xC0010117) — intercept reads (return 0) */
-  MsrpmSetIntercept(msrpm, (UINT32)MSR_VM_HSAVE_PA, TRUE, FALSE);
-
-  /* SVM_KEY (0xC0010118) — intercept reads */
-  MsrpmSetIntercept(msrpm, (UINT32)MSR_SVM_KEY, TRUE, FALSE);
+  /* (No MsrpmSetIntercept calls — keep fully zero) */
 
   g_HvData.MsrPermissionMapPa = MmGetPhysicalAddress(g_HvData.MsrPermissionMap);
 
@@ -280,6 +271,22 @@ NTSTATUS SvmInitializeVcpu(_In_ ULONG ProcessorIndex,
   vcpu->GuestVmcbPa = MmGetPhysicalAddress(vcpu->GuestVmcb);
 
   /* ------------------------------------------------------------------
+   * CRITICAL: Capture hidden segment state FIRST via VMSAVE.
+   *
+   * VMSAVE writes FS.base, GS.base, TR.base, LDTR.base, KernelGsBase,
+   * STAR, LSTAR, CSTAR, SFMASK, SYSENTER_* into the VMCB state save area.
+   * These "hidden" fields are NOT accessible via intrinsics and are
+   * REQUIRED for the guest to run correctly (without them: triple fault).
+   *
+   * We do this HERE, at the start, before setting any explicit fields.
+   * This way our later explicit writes (EFER, CR3, segments, etc.) correctly
+   * OVERWRITE on top of the hidden state — not the other way around.
+   *
+   * SVME must already be enabled in the calling DPC before this runs.
+   * ------------------------------------------------------------------ */
+  __svm_vmsave(vcpu->GuestVmcbPa.QuadPart);
+
+  /* ------------------------------------------------------------------
    * Allocate Host VMCB — for VMSAVE/VMLOAD host state
    * ------------------------------------------------------------------ */
   vcpu->HostVmcb = (PVMCB)MmAllocateContiguousMemory(sizeof(VMCB), maxAddr);
@@ -309,28 +316,39 @@ NTSTATUS SvmInitializeVcpu(_In_ ULONG ProcessorIndex,
    * ------------------------------------------------------------------ */
   PVMCB_CONTROL_AREA ctrl = &vcpu->GuestVmcb->Control;
 
-  /* Intercept CPUID (bit 18 of DWORD 3 at offset 0x00C) */
-  ctrl->InterceptMisc1 |= INTERCEPT_CPUID_;
+  /* Intercept CPUID — DISABLED (reference svm.c uses Word3=0, no CPUID VMEXIT).
+   * Intercepting CPUID on every guest cpuid instruction causes a massive VMEXIT
+   * storm during Windows boot (CPUID is called thousands of times per second).
+   * With GIF=0 and no STGI, these exits pile up and starve the scheduler,
+   * triggering the watchdog reboot. Pass CPUID through natively. */
+  // ctrl->InterceptMisc1 |= INTERCEPT_CPUID_;
 
-  /* Intercept MSR via MSRPM (bit 28 of DWORD 3) */
-  ctrl->InterceptMisc1 |= INTERCEPT_MSR_PROT;
+  /* Intercept MSR via MSRPM — DISABLED.
+   * MSRPM is zeroed (see SvmAllocateMsrpm), so all MSRs pass through.
+   * Keeping this bit ON with a zeroed MSRPM is safe but adds unnecessary
+   * VMEXIT overhead. Removing prevents any MSR VMEXIT path. */
+  // ctrl->InterceptMisc1 |= INTERCEPT_MSR_PROT;
 
   /* NMI intercept DISABLED - causes VMRUN hang on some systems.
    * svm-vmm doesn't intercept NMI and works fine. */
   // ctrl->InterceptMisc1 |= INTERCEPT_NMI;
 
-  /* Intercept #MC — Machine Check Exception (vector 18 in DWORD 2) */
-  ctrl->InterceptException |= INTERCEPT_EXCEPTION_MC;
+  /* #MC intercept DISABLED — Phase A stability fix.
+   * Machine Check Exceptions must be delivered natively; intercepting them
+   * and re-injecting via EventInj was found to corrupt the EventInj error-code
+   * field on some AMD microcode versions, causing a shutdown VMEXIT loop.
+   * Let the OS MCE handler run directly. */
+  // ctrl->InterceptException |= INTERCEPT_EXCEPTION_MC;
 
-  /* Intercept VMRUN, VMMCALL, VMLOAD, VMSAVE (DWORD 4 at offset 0x010) */
+  /* Intercept VMRUN, VMMCALL, VMLOAD, VMSAVE (DWORD 4 at offset 0x010).
+   * VMRUN MUST be intercepted (AMD APM requirement for nested hypervisors).
+   * STGI/CLGI intercepts REMOVED — Windows kernel executes STGI/CLGI on AMD
+   * in certain paths; injecting #UD caused a double-fault->triple fault cycle
+   * that rebooted the machine within ~2 seconds of load. */
   ctrl->InterceptMisc2 |= INTERCEPT_VMRUN_;
   ctrl->InterceptMisc2 |= INTERCEPT_VMMCALL_;
   ctrl->InterceptMisc2 |= INTERCEPT_VMLOAD_;
   ctrl->InterceptMisc2 |= INTERCEPT_VMSAVE_;
-
-  /* Intercept STGI/CLGI for safety (prevent guest from manipulating GIF) */
-  ctrl->InterceptMisc2 |= INTERCEPT_STGI_;
-  ctrl->InterceptMisc2 |= INTERCEPT_CLGI_;
 
   /* Intercept SHUTDOWN — catches triple faults as VMEXIT instead of
    * crashing to VMware's "CPU shutdown" dialog. Critical for debugging. */
@@ -876,10 +894,13 @@ BOOLEAN SvmVmexitHandler(_Inout_ PVCPU_DATA Vcpu,
    * MINIMAL HANDLER — ZERO kernel calls (runs with GIF=0 or GIF=1).
    * Only uses intrinsics and direct VMCB writes. No DbgPrintEx,
    * no InterlockedCompareExchange, no spinlocks.
+   *
+   * TSC offset compensation DISABLED (Phase C fix):
+   *   TscOffset started at 0 and was decremented on every VMEXIT, wrapping
+   *   to a huge positive value (UINT64 underflow). This caused RDTSC from the
+   *   guest to return impossible future timestamps, triggering watchdog reboots.
+   *   Leave TscOffset = 0 until a proper initialization strategy is implemented.
    */
-
-  /* Capture TSC at VMEXIT entry for timing compensation */
-  UINT64 tscEntry = __rdtsc();
 
   /* Check devirtualize flag (volatile read, no Interlocked needed) */
   if (g_HvData.DevirtualizeFlag) {
@@ -1332,20 +1353,24 @@ BOOLEAN SvmVmexitHandler(_Inout_ PVCPU_DATA Vcpu,
     Vcpu->GuestVmcb->Control.EventInj = EVENTINJ_NMI_INJECT;
     break;
 
-  case VMEXIT_EXCEPTION_MC:
-    Vcpu->GuestVmcb->Control.EventInj =
-        EVENTINJ_VALID | EVENTINJ_TYPE_EXCEPTION | 18;
-    break;
+  /* VMEXIT_EXCEPTION_MC REMOVED — #MC intercept is disabled (see VMCB setup).
+   * If somehow a stale VMCB triggers an MCE exit, fall through to default
+   * which will advance RIP if an instruction length is available. */
 
   case VMEXIT_VMRUN:
-  case VMEXIT_VMMCALL:
   case VMEXIT_VMLOAD:
   case VMEXIT_VMSAVE:
-  case VMEXIT_STGI:
-  case VMEXIT_CLGI:
-    /* Inject #UD — guest shouldn't use SVM instructions */
+    /* Inject #GP(0) — same as bare-metal behavior when ring-0 code tries to
+     * execute nested SVM instructions while SVM is already active.
+     * NOTE: #GP requires an error code; EventInj bits[63:32] = error code (0). */
     Vcpu->GuestVmcb->Control.EventInj =
-        EVENTINJ_VALID | EVENTINJ_TYPE_EXCEPTION | 6; /* #UD = vector 6 */
+        EVENTINJ_VALID | EVENTINJ_TYPE_EXCEPTION | EVENTINJ_ERROR_VALID | 13; /* #GP = vector 13 */
+    break;
+
+  case VMEXIT_VMMCALL:
+    /* VMMCALL from guest — on bare metal without SVM this raises #UD.
+     * Inject #UD so the guest sees the same behavior as native hardware. */
+    Vcpu->GuestVmcb->Control.EventInj = EVENTINJ_UD;
     break;
 
   case VMEXIT_SHUTDOWN:
@@ -1407,14 +1432,6 @@ BOOLEAN SvmVmexitHandler(_Inout_ PVCPU_DATA Vcpu,
    */
   Vcpu->GuestVmcb->Control.TlbControl = TLB_CONTROL_DO_NOTHING;
 
-  /*
-   * Anti-detection: subtract VMEXIT handler time from guest-visible TSC.
-   * Hardware TscOffset is applied automatically on every guest RDTSC/RDTSCP.
-   * This accumulates across VMEXITs, keeping the guest's view of time clean.
-   */
-  UINT64 tscExit = __rdtsc();
-  Vcpu->GuestVmcb->Control.TscOffset -= (INT64)(tscExit - tscEntry);
-
   return FALSE; /* Continue running the guest */
 }
 
@@ -1441,9 +1458,45 @@ static VOID SvmSubvertProcessorDpc(_In_ PKDPC Dpc,
 
   HV_LOG("CPU %u: Subvert DPC starting", cpuIndex);
 
-  /* Allocate and initialize VCPU for this processor */
+  /* ------------------------------------------------------------------
+   * Enable EFER.SVME FIRST, before any allocations that need it.
+   *
+   * The __svm_vmsave(GuestVmcbPa) call inside SvmInitializeVcpu (which
+   * captures hidden segment state) requires SVME=1 in EFER to function
+   * correctly. On some AMD microcode revisions, VMSAVE #GPs if SVME=0.
+   * Enable it here unconditionally before calling SvmInitializeVcpu.
+   *
+   * VMSAVE does NOT require VM_HSAVE_PA to be valid — it takes the
+   * target physical address directly from RAX. We set the real HSAVE_PA
+   * after the VCPU is allocated below.
+   * ------------------------------------------------------------------ */
+  UINT64 efer = __readmsr(MSR_EFER);
+  efer |= EFER_SVME;
+  __writemsr(MSR_EFER, efer);
+
+  /* Provide a temporary valid HSAVE_PA so the processor is in a consistent
+   * SVM-enabled state. We overwrite this with the real HostSaveAreaPa below. */
+  PHYSICAL_ADDRESS tmpMaxAddr;
+  tmpMaxAddr.QuadPart = MAXULONG64;
+  PVOID tmpSaveArea = MmAllocateContiguousMemory(PAGE_SIZE, tmpMaxAddr);
+  if (tmpSaveArea) {
+    RtlZeroMemory(tmpSaveArea, PAGE_SIZE);
+    __writemsr(MSR_VM_HSAVE_PA, MmGetPhysicalAddress(tmpSaveArea).QuadPart);
+  }
+
+  /* ------------------------------------------------------------------
+   * Allocate and initialize VCPU for this processor.
+   * __svm_vmsave(GuestVmcbPa) runs inside SvmInitializeVcpu FIRST
+   * (before explicit field setup), capturing FS/GS/TR/LDTR hidden state
+   * with SVME=1. Then EFER/CR0/CR3/CR4/segments are set explicitly on top.
+   * ------------------------------------------------------------------ */
   PVCPU_DATA vcpu = NULL;
   status = SvmInitializeVcpu(cpuIndex, &vcpu);
+
+  /* Free the temporary save area now — we'll point HSAVE_PA at the real one */
+  if (tmpSaveArea)
+    MmFreeContiguousMemory(tmpSaveArea);
+
   if (!NT_SUCCESS(status)) {
     HV_LOG_ERROR("CPU %u: SvmInitializeVcpu failed (0x%08X)", cpuIndex, status);
     goto DpcComplete;
@@ -1453,36 +1506,15 @@ static VOID SvmSubvertProcessorDpc(_In_ PKDPC Dpc,
   g_HvData.VcpuArray[cpuIndex] = vcpu;
 
   /* ------------------------------------------------------------------
-   * Enable EFER.SVME — this enables SVM on this processor
-   * ------------------------------------------------------------------ */
-  UINT64 efer = __readmsr(MSR_EFER);
-  efer |= EFER_SVME;
-  __writemsr(MSR_EFER, efer);
-
-  /* ------------------------------------------------------------------
-   * Set VM_HSAVE_PA — MANDATORY before first VMRUN. #GP if zero.
+   * Set VM_HSAVE_PA to the real host save area — MANDATORY before VMRUN.
    * ------------------------------------------------------------------ */
   __writemsr(MSR_VM_HSAVE_PA, vcpu->HostSaveAreaPa.QuadPart);
 
   /* ------------------------------------------------------------------
-   * Save host state into the Host VMCB via VMSAVE
-   *
-   * VMSAVE saves: FS, GS, TR, LDTR (hidden bases), KernelGsBase,
-   * STAR, LSTAR, CSTAR, SFMASK, SYSENTER_*
+   * Save host hidden state (FS/GS/TR/LDTR bases, STAR, etc.) into the
+   * Host VMCB via VMSAVE. This is used by VMLOAD in the VMRUN loop.
    * ------------------------------------------------------------------ */
   __svm_vmsave(vcpu->HostVmcbPa.QuadPart);
-
-  /* ------------------------------------------------------------------
-   * Capture guest segment hidden state via VMSAVE
-   *
-   * VMSAVE saves FS.base, GS.base, TR, LDTR, KernelGsBase, STAR, etc.
-   * These are CRITICAL for the guest to run - without them, triple fault.
-   *
-   * VMSAVE also captures RIP/RSP/RAX from the current CPU state.
-   * The assembly code in SvmLaunchVm will override RIP/RSP before VMRUN
-   * to point to @@GuestEntry and OriginalRsp.
-   * ------------------------------------------------------------------ */
-  __svm_vmsave(vcpu->GuestVmcbPa.QuadPart);
 
   /* ------------------------------------------------------------------
    * Set the guest RIP and RSP to return to right after SvmLaunchVm
